@@ -17,7 +17,7 @@ from telegram.ext import (
 # ----------------------- CONSTANTS / GLOBALS -----------------------
 IST = ZoneInfo("Asia/Kolkata")
 BOT_NAME = "IndiQuant AutoScan"
-VERSION = "v2.0"
+VERSION = "v2.0.1"
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("indiquant.autoscan")
 
@@ -272,7 +272,6 @@ def compute_levels(symbol: str, tf: str, session: str, C: dict, strategy: str="a
     # Strategy selection
     st = strategy.lower()
     if st == "auto":
-        # prefer trend+pullback; else RSI2; else Donchian
         if last["ema_fast"] > last["ema_slow"] and last["close"] <= last["ema_fast"]:
             st = "ema"
         elif rsi2_now <= C["signal"]["params"].get("rsi2_th", 10):
@@ -290,18 +289,17 @@ def compute_levels(symbol: str, tf: str, session: str, C: dict, strategy: str="a
         idea = f"EMA({C['signal']['params'].get('ema_fast',20)}/{C['signal']['params'].get('ema_slow',50)}) trend + pullback"
         conf = 50 + 10 + (10 if adv_ok else 0) + (10 if last["close"] <= last["ema_fast"] else 0)
     elif st == "rsi2":
-        # Mean reversion: require price above SMA200; buy on oversold RSI2
         sma200 = float(sma(close, 200).iloc[-1])
         if np.isnan(sma200): raise RuntimeError("SMA200 unavailable")
         if last["close"] < sma200:
             raise RuntimeError("RSI2 setup blocked by SMA200 filter (price < SMA200)")
-        raw_entry = last["close"] * 1.001  # confirm with small stop-trigger above close
+        raw_entry = last["close"] * 1.001
         idea = f"RSI2<{C['signal']['params'].get('rsi2_th',10)} + SMA200 trend filter"
         conf = 50 + 10 + (10 if adv_ok else 0) + (10 if rsi2_now <= C['signal']['params'].get('rsi2_th',10) else 0)
     elif st == "donchian":
         if last["don_hi"] is None:
             raise RuntimeError("Donchian bands unavailable")
-        raw_entry = (last["don_hi"] + 0.01)  # breakout above upper band
+        raw_entry = (last["don_hi"] + 0.01)
         idea = f"Donchian breakout N={don_n}"
         conf = 50 + 10 + (10 if adv_ok else 0)
     else:
@@ -421,6 +419,7 @@ async def push_html(context: ContextTypes.DEFAULT_TYPE, chat_id: int, html: str)
                                    reply_markup=kb, disable_web_page_preview=True)
 
 async def scan_once_for_tf(context: ContextTypes.DEFAULT_TYPE, tf: str):
+    global SENT_THIS_MINUTE  # <-- FIX: declare at top since we increment it below
     ts = now_ist()
     RUNTIME["ist_ts"] = ist_iso(ts)
     RUNTIME["scan_status"] = "running" if is_market_open(ts) else "idle"
@@ -471,7 +470,6 @@ async def scan_once_for_tf(context: ContextTypes.DEFAULT_TYPE, tf: str):
             try:
                 await push_html(context, int(chat_id), html)
                 shipped += 1
-                global SENT_THIS_MINUTE
                 SENT_THIS_MINUTE += 1
                 SYMBOL_COUNT[skey] = SYMBOL_COUNT.get(skey, 0) + 1
                 # Validity window for dedupe
@@ -702,10 +700,6 @@ class BTResult:
         self.trades = trades
 
 def compute_levels_daily_row(row_idx: int, df: pd.DataFrame, C: dict, strategy: str) -> Optional[Tuple[float,float,float]]:
-    """
-    Compute next-day entry/SL/TP from data up to (and including) row_idx (signal on close),
-    return (entry, sl, tp) or None if no setup.
-    """
     close = df["Close"].iloc[:row_idx+1]
     high = df["High"].iloc[:row_idx+1]
     low  = df["Low"].iloc[:row_idx+1]
@@ -717,7 +711,6 @@ def compute_levels_daily_row(row_idx: int, df: pd.DataFrame, C: dict, strategy: 
 
     last_close = float(close.iloc[-1])
     last_high  = float(high.iloc[-1])
-    last_low   = float(low.iloc[-1])
     last_ema_f = float(ema_fast.iloc[-1])
     last_ema_s = float(ema_slow.iloc[-1])
     last_atr   = float(atr14.iloc[-1])
@@ -758,14 +751,7 @@ def compute_levels_daily_row(row_idx: int, df: pd.DataFrame, C: dict, strategy: 
     if not (sl < entry < tp): return None
     return (entry, sl, tp)
 
-def backtest_daily(symbol: str, start: str, end: str, C: dict, strategy: str="auto", capital_start: float=100000.0) -> BTResult:
-    """
-    Simple daily closed-bar backtest:
-      - Signal computed on close of day t; enter at next day's OPEN.
-      - Exit via TP/SL using day High/Low (assume SL priority if both touched same day).
-      - 1 position at a time; quantity = floor(cash / entry).
-      - Includes costs & slippage via cost_per_share.
-    """
+def backtest_daily(symbol: str, start: str, end: str, C: dict, strategy: str="auto", capital_start: float=100000.0):
     df = fetch_daily(symbol, start, end)
     df = df.dropna().copy()
     if len(df) < 260:
@@ -780,56 +766,46 @@ def backtest_daily(symbol: str, start: str, end: str, C: dict, strategy: str="au
     trades = []
 
     for i in range(60, len(df)-1):  # start when indicators stable
-        today = df.iloc[i]
         nextbar = df.iloc[i+1]
-        dt = df.index[i].date()
         n_dt = df.index[i+1].date()
 
-        # If flat, look for setup
         if pos_qty == 0:
             lv = compute_levels_daily_row(i, df, C, strategy)
             if lv:
                 entry_px, sl_px, tp_px = lv
-                # Enter at next day's open
                 px_open = float(nextbar["Open"])
                 entry_fill = round_tick(max(entry_px, px_open), tick)  # conservative: stop or better
-                per_share_cost = cost_per_share(entry_fill, entry_fill, C)  # entry part approx
+                per_share_cost = cost_per_share(entry_fill, entry_fill, C)
                 qty = int(cash // entry_fill)
                 if qty > 0:
                     pos_qty = qty
                     pos_entry = entry_fill
                     pos_sl = sl_px
                     pos_tp = tp_px
-                    cost_entry_total = per_share_cost * qty / 2.0  # half cost on entry (approx)
+                    cost_entry_total = per_share_cost * qty / 2.0  # approx half on entry
                     cash -= qty * entry_fill + cost_entry_total
                     trades.append({"date": str(n_dt), "action":"BUY", "price": entry_fill, "qty": qty, "cash": cash})
         else:
-            # Manage position on next bar (i+1): check SL/TP with day range
             day_high = float(nextbar["High"])
             day_low  = float(nextbar["Low"])
             exit_px = None
             reason = None
-            # Conservative: if both touched, assume SL triggered first
             if day_low <= pos_sl:
                 exit_px = round_tick(pos_sl, tick)
                 reason = "SL"
             elif day_high >= pos_tp:
                 exit_px = round_tick(pos_tp, tick)
                 reason = "TP"
-
-            # If exit condition met
             if exit_px is not None:
-                # Costs round-trip
                 per_share_cost = cost_per_share(pos_entry, exit_px, C)
                 pnl_gross = (exit_px - pos_entry) * pos_qty
                 pnl_net = pnl_gross - per_share_cost * pos_qty
-                cash += pos_qty * exit_px - (per_share_cost * pos_qty / 2.0)  # approx half cost on exit
+                cash += pos_qty * exit_px - (per_share_cost * pos_qty / 2.0)  # approx half on exit
                 trades.append({"date": str(n_dt), "action":reason, "price": exit_px, "qty": -pos_qty,
                                "pnl_net": pnl_net, "cash": cash})
                 pos_qty = 0
                 pos_entry = pos_sl = pos_tp = None
 
-    # Close any open position at last close conservatively
     if pos_qty > 0:
         last_close = float(df.iloc[-1]["Close"])
         exit_px = round_tick(last_close, tick)
@@ -840,21 +816,16 @@ def backtest_daily(symbol: str, start: str, end: str, C: dict, strategy: str="au
         trades.append({"date": str(df.index[-1].date()), "action":"EOD", "price": exit_px, "qty": -pos_qty,
                        "pnl_net": pnl_net, "cash": cash})
 
-    # Build equity curve (approx from trades)
     trades_df = pd.DataFrame(trades)
     if trades_df.empty:
         raise RuntimeError("No trades generated in backtest window.")
 
-    # Reconstruct daily equity using cash; assume cash is equity when flat
-    # For metrics, compute daily returns from equity curve sampled at trade dates
     equity = trades_df["cash"]
     total_ret = (equity.iloc[-1] - capital_start) / capital_start
     days = max(1, (df.index[-1].date() - df.index[60].date()).days)
     cagr = (1 + total_ret) ** (365.25 / days) - 1 if days > 0 else 0.0
 
-    # Approx daily returns from trade PnLs over capital
     pnl_series = trades_df.get("pnl_net", pd.Series(dtype=float)).fillna(0.0)
-    # Map pnl to dates at transactions; simple approximation
     daily_ret = pnl_series / capital_start
     if len(daily_ret) < 2:
         sharpe = sortino = vol = 0.0
@@ -864,13 +835,11 @@ def backtest_daily(symbol: str, start: str, end: str, C: dict, strategy: str="au
         sharpe = float(np.mean(daily_ret) / (np.std(daily_ret, ddof=1) + 1e-9)) * math.sqrt(252)
         sortino = float(np.mean(daily_ret) / (downside + 1e-9))
 
-    # Max drawdown (from equity at trade points)
     eq_vals = equity.values.astype(float)
     peaks = np.maximum.accumulate(eq_vals)
     dds = (eq_vals - peaks) / peaks
     maxdd = float(np.min(dds)) if len(dds) else 0.0
 
-    # Win rate & profit factor
     trade_pnls = trades_df["pnl_net"].dropna()
     wins = trade_pnls[trade_pnls > 0].sum()
     losses = -trade_pnls[trade_pnls < 0].sum()
