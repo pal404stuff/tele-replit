@@ -6,3 +6,4 @@ pandas
 python-telegram-bot
 telegram
 yfinance
+python-telegram-bot[job-queue]

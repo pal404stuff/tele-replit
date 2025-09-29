@@ -365,6 +365,7 @@ async def push_html(context: ContextTypes.DEFAULT_TYPE, chat_id: int, html: str)
                                    reply_markup=kb, disable_web_page_preview=True)
 
 async def scan_once_for_tf(context: ContextTypes.DEFAULT_TYPE, tf: str):
+    global SENT_THIS_MINUTE
     ts = now_ist()
     RUNTIME["ist_ts"] = ist_iso(ts)
     RUNTIME["scan_status"] = "running" if is_market_open(ts) else "idle"
@@ -418,7 +419,6 @@ async def scan_once_for_tf(context: ContextTypes.DEFAULT_TYPE, tf: str):
             try:
                 await push_html(context, int(chat_id), html)
                 shipped += 1
-                global SENT_THIS_MINUTE
                 SENT_THIS_MINUTE += 1
                 SYMBOL_COUNT[skey] = SYMBOL_COUNT.get(skey, 0) + 1
                 # Validity window for dedupe
