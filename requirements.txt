@@ -1,9 +1,4 @@
-python-telegram-bot>=20,<22
+python-telegram-bot[job-queue]>=20,<22
 yfinance>=0.2.40
 pandas>=2.0.0
 numpy>=1.23.0
-pandas
-python-telegram-bot
-telegram
-yfinance
-python-telegram-bot[job-queue]
