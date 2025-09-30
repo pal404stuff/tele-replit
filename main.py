@@ -1,5 +1,5 @@
 # main.py
-# IndiQuant Apex AutoScan — NSE/BSE • IST • Bloomberg-grade (v3.1.0)
+# IndiQuant Apex AutoScan — NSE/BSE • IST • Bloomberg-grade (v3.2.0)
 # Educational only — not investment advice. Not SEBI-registered. Markets carry risk.
 
 import os, json, uuid, logging, math, textwrap
@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import requests  # NEW
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
@@ -19,7 +20,7 @@ from telegram.ext import (
 # =========================== GLOBALS / CONSTANTS ===========================
 IST = ZoneInfo("Asia/Kolkata")
 BOT_NAME = "IndiQuant Apex AutoScan"
-VERSION = "v3.1.0"
+VERSION = "v3.2.0"
 COMPLIANCE = "Educational only — not investment advice. Not SEBI-registered. Markets carry risk."
 
 logging.basicConfig(
@@ -106,32 +107,130 @@ SENT_THIS_MINUTE = 0
 # per-symbol/session count: (symbol, YYYY-MM-DD) -> count
 SYMBOL_COUNT: Dict[Tuple[str,str], int] = {}
 
+# ============================ NSE INDEX HELPERS ============================
+NSE_BASE = "https://www.nseindia.com"
+NSE_EQ_INDEX_URL = f"{NSE_BASE}/api/equity-stockIndices"
+NSE_INDEX_LIST_URL = f"{NSE_BASE}/api/allIndices"
+NSE_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124.0.0.0 Safari/537.36"),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+    "Referer": "https://www.nseindia.com/market-data/live-equity-market",
+}
+NSE_CACHE_PATH = "/mnt/data/nse_cache.json"
+_NSE_CACHE_MEM: Dict[str, Tuple[datetime, List[str]]] = {}
+def _load_nse_cache_disk():
+    try:
+        if os.path.exists(NSE_CACHE_PATH):
+            with open(NSE_CACHE_PATH, "r") as f:
+                raw = json.load(f)
+            for k, v in raw.items():
+                exp = datetime.fromisoformat(v["expiry"])
+                _NSE_CACHE_MEM[k] = (exp, v["symbols"])
+    except Exception as e:
+        log.warning(f"Failed to load NSE cache: {e}")
+def _save_nse_cache_disk():
+    try:
+        out = {k: {"expiry": exp.isoformat(), "symbols": syms}
+               for k,(exp,syms) in _NSE_CACHE_MEM.items()}
+        os.makedirs(os.path.dirname(NSE_CACHE_PATH), exist_ok=True)
+        with open(NSE_CACHE_PATH, "w") as f:
+            json.dump(out, f)
+    except Exception as e:
+        log.warning(f"Failed to save NSE cache: {e}")
+def _nse_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update(NSE_HEADERS)
+    s.get(NSE_BASE, timeout=10)
+    return s
+def fetch_nse_index_symbols(index_name: str, ttl_sec: int = 6*3600) -> List[str]:
+    """Return list of NSE symbols for an index name (e.g., 'NIFTY 50'). Uses cache (mem+disk)."""
+    key = index_name.strip().upper()
+    now = datetime.now(tz=IST)
+    # load disk cache once
+    if not _NSE_CACHE_MEM:
+        _load_nse_cache_disk()
+    # mem cache
+    if key in _NSE_CACHE_MEM:
+        exp, syms = _NSE_CACHE_MEM[key]
+        if now < exp:
+            return syms
+    # fetch with small retry/backoff
+    symbols: List[str] = []
+    try:
+        ses = _nse_session()
+        for attempt in range(3):
+            try:
+                r = ses.get(NSE_EQ_INDEX_URL, params={"index": index_name}, timeout=12)
+                if r.status_code in (200, 304):
+                    j = r.json()
+                    data = j.get("data", j)
+                    for row in data:
+                        sym = (row.get("symbol") or "").strip().upper()
+                        if sym:
+                            symbols.append(sym)
+                    break
+                elif r.status_code in (403, 429):
+                    # backoff
+                    import time as _t
+                    _t.sleep(1.5 * (attempt+1))
+                    continue
+                else:
+                    r.raise_for_status()
+            except Exception:
+                if attempt == 2:
+                    raise
+    except Exception as e:
+        log.warning(f"NSE fetch failed for index='{index_name}': {e}")
+        symbols = []
+    # update caches
+    _NSE_CACHE_MEM[key] = (now + timedelta(seconds=ttl_sec), symbols)
+    _save_nse_cache_disk()
+    return symbols
+def fetch_all_indices() -> List[str]:
+    try:
+        ses = _nse_session()
+        r = ses.get(NSE_INDEX_LIST_URL, timeout=12)
+        r.raise_for_status()
+        try:
+            j = r.json()
+            items = j.get("data", [])
+            names = sorted({it.get("index") for it in items if it.get("index")})
+            return names
+        except ValueError:
+            lines = r.text.splitlines()
+            if not lines: return []
+            header = [h.strip().lower() for h in lines[0].split(",")]
+            idx = header.index("index") if "index" in header else 0
+            names = sorted({ln.split(",")[idx].strip() for ln in lines[1:] if ln.strip()})
+            return names
+    except Exception as e:
+        log.warning(f"NSE allIndices fetch failed: {e}")
+        return []
+
 # ================================ HELPERS ==================================
 def now_ist() -> datetime:
     return datetime.now(tz=IST)
-
 def ist_iso(dt: Optional[datetime]=None) -> str:
     return (dt or now_ist()).astimezone(IST).isoformat(timespec="seconds")
-
 def parse_hhmm(s: str) -> dtime:
     h, m = map(int, s.split(":"))
     return dtime(hour=h, minute=m, tzinfo=IST)
-
 def in_window(ts: datetime, start_hhmm: str, end_hhmm: str) -> bool:
     t = ts.timetz()
     return parse_hhmm(start_hhmm) <= t <= parse_hhmm(end_hhmm)
-
 def in_any_quiet(ts: datetime) -> bool:
     for w in SCHEDULE.get("quiet_windows", []):
         if in_window(ts, w["start"], w["end"]):
             return True
     return False
-
 def is_market_open(ts: datetime) -> bool:
     if ts.weekday() >= 5:  # Sat/Sun
         return False
     return in_window(ts, SCHEDULE["market_window"]["start"], SCHEDULE["market_window"]["end"])
-
 def bar_close_now(ts: datetime, tf: str) -> bool:
     m, s = ts.minute, ts.second
     if not is_market_open(ts): return False
@@ -140,23 +239,18 @@ def bar_close_now(ts: datetime, tf: str) -> bool:
     if tf == "15m": return (m % 15 == 0) and s == 0
     if tf == "1h":  return (m == 0) and (s == 0)
     if tf.upper() == "D":
-        # fire once ~ after session end (15:31:00)
         end = SCHEDULE["market_window"]["end"]
         eh, em = map(int, end.split(":"))
         return (ts.hour == eh and ts.minute == em + 1 and s == 0)
     return False
-
 def yahoo_symbol(symbol: str) -> str:
     s = symbol.strip().upper()
     if s.endswith(".NS") or s.endswith(".BO"): return s
     return s + ".NS"
-
 def round_tick(p: float, tick: float) -> float:
     return round(p / tick) * tick
-
 def symbol_session_key(sym: str, ts: datetime) -> Tuple[str,str]:
     return (sym.upper(), ts.strftime("%Y-%m-%d"))
-
 def reset_throttle_if_new_minute(ts: datetime):
     global CURRENT_MINUTE, SENT_THIS_MINUTE
     key = ts.strftime("%Y-%m-%d %H:%M")
@@ -167,10 +261,8 @@ def reset_throttle_if_new_minute(ts: datetime):
 # ============================= INDICATORS ==================================
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
-
 def sma(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window).mean()
-
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     up = delta.clip(lower=0.0)
@@ -179,32 +271,24 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     loss = down.rolling(period).mean()
     rs = gain / (loss.replace(0, np.nan))
     return 100 - (100 / (1 + rs))
-
 def rsi2(series: pd.Series) -> pd.Series:
     return rsi(series, 2)
-
 def atr(high: pd.Series, low: pd.Series, close: pd.Series, period=14) -> pd.Series:
     prev_close = close.shift(1)
     tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
     return tr.rolling(period).mean()
-
 def donchian(high: pd.Series, low: pd.Series, n: int=20) -> Tuple[pd.Series, pd.Series]:
     return high.rolling(n).max(), low.rolling(n).min()
-
 def is_inside_bar(h: pd.Series, l: pd.Series) -> pd.Series:
     return (h <= h.shift(1)) & (l >= l.shift(1))
-
 def nr_n(h: pd.Series, l: pd.Series, n:int) -> pd.Series:
     rng = (h - l)
     return rng == rng.rolling(n).min()
-
 def vol_pctile(close: pd.Series, high: pd.Series, low: pd.Series, lookback: int = 90) -> float:
-    # ATR/Close percentile
     a = atr(high, low, close, 14)
     vol = (a / close).tail(lookback).dropna()
     if vol.empty: return 50.0
     return float((vol.rank(pct=True).iloc[-1] * 100.0))
-
 def adv_inr(df: pd.DataFrame, window: int = 20) -> Optional[float]:
     if "Close" not in df or "Volume" not in df: return None
     dv = (df["Close"] * df["Volume"]).rolling(window).mean().dropna()
@@ -220,13 +304,11 @@ def fetch_intraday(symbol: str, tf: str) -> pd.DataFrame:
     if df is None or df.empty: raise RuntimeError("No data")
     df = df.rename(columns=str.title).dropna()
     return df
-
 def fetch_daily(symbol: str, start: Optional[str]=None, end: Optional[str]=None) -> pd.DataFrame:
     df = yf.download(tickers=yahoo_symbol(symbol), start=start, end=end, auto_adjust=True, progress=False)
     if df is None or df.empty: raise RuntimeError("No data")
     df = df.rename(columns=str.title).dropna()
     return df
-
 def fetch_ohlcv(symbol: str, tf: str) -> pd.DataFrame:
     if tf.upper() == "D":
         return fetch_daily(symbol)
@@ -235,7 +317,6 @@ def fetch_ohlcv(symbol: str, tf: str) -> pd.DataFrame:
 # =============================== COSTS =====================================
 def cost_per_share(entry: float, exit_px: float, C: dict) -> float:
     c = C["costs"]
-    # turnover per side approximated by price; sum buy+sell
     turn = entry + exit_px
     if c["brokerage_model"] == "flat":
         brokerage = c["brokerage_flat_inr"] * 2
@@ -248,11 +329,9 @@ def cost_per_share(entry: float, exit_px: float, C: dict) -> float:
     gst   = (brokerage + exch + sebi) * c["gst_pct"]
     slip  = (entry + exit_px) * (c.get("slippage_bps",0)/10000.0)
     return brokerage + stt + exch + sebi + stamp + gst + slip
-
 def rr_multiple(entry: float, sl: float, tp: float) -> float:
     risk = max(1e-9, entry - sl)
     return (tp - entry) / risk
-
 def net_rr(entry: float, sl: float, tp: float, C: dict) -> Tuple[float,float,float]:
     gross = rr_multiple(entry, sl, tp)
     cps = cost_per_share(entry, tp, C)
@@ -269,16 +348,12 @@ def mtf_ok(symbol: str, ltf_tf: str, htf_tf: str, ema_fast_n:int, ema_slow_n:int
         else:
             d = fetch_ohlcv(symbol, htf_tf)
         c = d["Close"]
-        if len(c) < max(ema_fast_n, ema_slow_n) + 5: return True  # don't block if insufficient
+        if len(c) < max(ema_fast_n, ema_slow_n) + 5: return True
         ema_f, ema_s = ema(c, ema_fast_n).iloc[-1], ema(c, ema_slow_n).iloc[-1]
         return bool(ema_f > ema_s)
     except Exception:
         return True  # do not block if htf unavailable
-
 def pick_strategy(symbol: str, tf: str, C: dict, df: pd.DataFrame) -> Tuple[str, Dict]:
-    """
-    Returns (strategy_name, details_dict) — details holds computed fields for reuse.
-    """
     close, high, low = df["Close"], df["High"], df["Low"]
     ema_fast_n = C["signal"]["params"].get("ema_fast", 20)
     ema_slow_n = C["signal"]["params"].get("ema_slow", 50)
@@ -309,33 +384,26 @@ def pick_strategy(symbol: str, tf: str, C: dict, df: pd.DataFrame) -> Tuple[str,
         "inside": inside, "nr4": nr4, "nr7": nr7, "vol_pctile": volp
     }
 
-    # MTF alignment (optional)
     mtf = C["signal"]["params"].get("mtf", {"enable":False})
     htf_ok = True
     if mtf.get("enable", False):
         htf_ok = mtf_ok(symbol, tf, mtf.get("htf","D"), ema_fast_n, ema_slow_n)
 
-    # Candidate ideas (evaluate RR later)
     ideas = []
-    # 1) Trend + Pullback
     if last["ema_fast"] > last["ema_slow"] and last["sma200"] and last["close"] >= last["sma200"] and last["close"] <= last["ema_fast"]:
         ideas.append(("ema", "EMA trend + pullback (EMA20/50, SMA200 health)"))
-    # 2) RSI2 MR (quality)
     if last["sma200"] and last["close"] > last["sma200"] and rsi2_now <= rsi2_th:
         ideas.append(("rsi2", f"RSI2<={rsi2_th} with SMA200 up"))
-    # 3) Donchian breakout / NR / InsideBar expansion
     if last["don_hi"] is not None:
         ideas.append(("donchian", f"Donchian breakout N={don_n}"))
     if inside or nr4 or nr7:
         ideas.append(("expansion", "Inside/NR expansion"))
-
-    # Default fallback
     if not ideas:
         ideas.append(("donchian", f"Donchian breakout N={don_n}"))
 
     details = {"last": last, "ema_fast_n": ema_fast_n, "ema_slow_n": ema_slow_n, "don_n": don_n,
-               "rsi2_th": rsi2_th, "htf_ok": htf_ok}
-    return ideas[0][0], {**details, "rsi2": rsi2_now, "inside": inside, "nr4": nr4, "nr7": nr7}
+               "rsi2_th": rsi2_th, "htf_ok": htf_ok, "inside": inside, "nr4": nr4, "nr7": nr7}
+    return ideas[0][0], {**details, "rsi2": rsi2_now}
 
 def compute_levels(symbol: str, tf: str, session: str, C: dict, strategy: str="auto") -> dict:
     df = fetch_ohlcv(symbol, tf)
@@ -343,14 +411,12 @@ def compute_levels(symbol: str, tf: str, session: str, C: dict, strategy: str="a
     close, high, low = df["Close"], df["High"], df["Low"]
     tick = C.get("tick_size", 0.05)
 
-    # Liquidity
     adv = adv_inr(df)
     adv_ok = adv is not None and adv >= C["filters"]["min_adv_inr"]
-    spread_ok = None  # not available from yfinance
-    band_ok = None    # not available — mark unknown
+    spread_ok = None  # unknown
+    band_ok = None    # unknown
 
-    # Decide strategy
-    if strategy.lower() == "auto" or strategy.lower() == "hybrid":
+    if strategy.lower() in ("auto","hybrid"):
         st, det = pick_strategy(symbol, tf, C, df)
     else:
         st = strategy.lower()
@@ -358,12 +424,10 @@ def compute_levels(symbol: str, tf: str, session: str, C: dict, strategy: str="a
 
     last = det["last"]
     ema_fast_n = det["ema_fast_n"]; ema_slow_n = det["ema_slow_n"]; don_n = det["don_n"]; rsi2_th = det["rsi2_th"]
-
     k = float(C["sl"]["params"].get("atr_k", 2.5))
     R = float(C["tp"]["params"].get("r", 2.0))
     entry_type = "stop"
 
-    # Compute raw entry based on strategy
     if st == "ema":
         raw_entry = max(last["high"], last["close"]) * 1.001
         idea = f"EMA({ema_fast_n}/{ema_slow_n}) trend + pullback + ATR stop"
@@ -374,7 +438,7 @@ def compute_levels(symbol: str, tf: str, session: str, C: dict, strategy: str="a
         raw_entry = last["close"] * 1.001
         idea = f"RSI2<={rsi2_th} + SMA200 up + ATR stop"
         conf = 50 + 10 + (10 if adv_ok else 0) + (10 if det["htf_ok"] else 0) + 10
-    elif st == "donchian" or st == "expansion":
+    elif st in ("donchian","expansion"):
         if last["don_hi"] is None:
             raise RuntimeError("Donchian bands unavailable")
         bump = 0.01 if tick < 0.1 else tick
@@ -385,7 +449,6 @@ def compute_levels(symbol: str, tf: str, session: str, C: dict, strategy: str="a
     else:
         raise RuntimeError(f"Unknown strategy: {st}")
 
-    # Stops/Targets
     raw_sl = raw_entry - k * last["atr"]
     raw_tp = raw_entry + R * (raw_entry - raw_sl)
 
@@ -394,7 +457,6 @@ def compute_levels(symbol: str, tf: str, session: str, C: dict, strategy: str="a
     tp    = round_tick(raw_tp, tick)
     if not (sl < entry < tp): raise RuntimeError("Invalid levels after rounding")
 
-    # Confidence: volatility fit bonus
     volp = last["vol_pctile"]
     vp_lo = C["signal"]["params"].get("vol_pctile_low", 40)
     vp_hi = C["signal"]["params"].get("vol_pctile_high", 70)
@@ -429,7 +491,6 @@ def build_alert_html(levels: dict, C: dict) -> Tuple[str, dict]:
     valid_until = ts + timedelta(minutes=C.get("valid_minutes", 180))
     entry, sl, tp = levels["entry"]["price"], levels["sl"]["price"], levels["tp"]["price"]
     gross, net, cps = net_rr(entry, sl, tp, C)
-    # Aggressive filter
     if not C.get("aggressive", False) and net < 1.30:
         raise RuntimeError("Net RR below minimum 1.30:1")
 
@@ -503,22 +564,19 @@ async def scan_once_for_tf(context: ContextTypes.DEFAULT_TYPE, tf: str):
             deduped += 1
             continue
 
-        # per symbol/session gate
         skey = symbol_session_key(sym, ts)
         if SYMBOL_COUNT.get(skey, 0) >= max_per_symbol:
             skipped += 1
             continue
 
-        # per minute throttle
         if SENT_THIS_MINUTE >= max_per_min:
             RUNTIME["counters"]["suppressed"] += 1
             continue
 
-        # compute & send
         try:
             lv = compute_levels(sym, tf, CONFIG["session"], CONFIG, CONFIG["signal"]["name"])
             html, payload = build_alert_html(lv, CONFIG)
-        except Exception as e:
+        except Exception:
             skipped += 1
             continue
 
@@ -595,6 +653,8 @@ IST • NSE/BSE cash & ETFs • BUY-side alerts • closed bars
 Commands:
 /configure key=value ...             — costs/tick/session/square_off (AutoScan ON)
 /universe TCS,RELIANCE,...           — set symbols
+/universe_nse "NIFTY 50"             — pull symbols from NSE index (auto-encoding)
+/indices                             — list known NSE index names (preview)
 /timeframe 1m|5m|15m|1h|D            — default D (swing)
 /schedule tf=1h,D window=09:15-15:30 digest=30m
 /autoscan on|off
@@ -632,13 +692,11 @@ async def cmd_configure(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /configure key=value ...")
         return
     kv = parse_kv(context.args)
-    # costs
     for k in list(kv.keys()):
         if k in CONFIG["costs"]:
             v = kv.pop(k)
             try: CONFIG["costs"][k] = float(v)
             except: CONFIG["costs"][k] = v
-    # filters/session/misc
     if "min_adv" in kv: CONFIG["filters"]["min_adv_inr"] = float(kv.pop("min_adv"))
     if "max_spread" in kv: CONFIG["filters"]["max_spread_pct"] = float(kv.pop("max_spread"))
     if "band_guard" in kv: CONFIG["filters"]["band_guard"] = kv.pop("band_guard").lower() in ["1","on","true","yes"]
@@ -646,7 +704,6 @@ async def cmd_configure(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "valid_minutes" in kv: CONFIG["valid_minutes"] = int(kv.pop("valid_minutes"))
     if "session" in kv: CONFIG["session"] = kv.pop("session")
     if "square_off" in kv: CONFIG["square_off_time"] = kv.pop("square_off")
-    # flags
     SCHEDULE["autoscan"] = True
     RUNTIME["autoscan"] = "on"
     await update.message.reply_text(
@@ -663,6 +720,35 @@ async def cmd_universe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     CONFIG["universe"] = [s for s in syms.split(",") if s]
     RUNTIME["universe"] = CONFIG["universe"]
     await update.message.reply_text(f"Universe set: {', '.join(CONFIG['universe'])}")
+
+async def cmd_universe_nse(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await bind_chat(update)
+    if not context.args:
+        await update.message.reply_text('Usage: /universe_nse "NIFTY 50"\nTip: try /indices to see available names.')
+        return
+    index_name = " ".join(context.args).strip().strip('"').strip("'")
+    symbols = fetch_nse_index_symbols(index_name)
+    if not symbols:
+        await update.message.reply_text(
+            f"Could not load symbols for index: {index_name}. Try /indices to list discoverable indices."
+        )
+        return
+    CONFIG["universe"] = symbols
+    RUNTIME["universe"] = symbols
+    preview = ", ".join(symbols[:20]) + (" …" if len(symbols) > 20 else "")
+    await update.message.reply_text(
+        f"Universe set from NSE index: {index_name}\n{len(symbols)} symbols: {preview}"
+    )
+
+async def cmd_indices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    names = fetch_all_indices()
+    if not names:
+        await update.message.reply_text("Could not fetch index list from NSE right now.")
+        return
+    preview = ", ".join(names[:60])
+    await update.message.reply_text(
+        f"Known indices (partial): {preview}\n\nExample: /universe_nse \"NIFTY 50\""
+    )
 
 async def cmd_timeframe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await bind_chat(update)
@@ -779,11 +865,10 @@ def compute_levels_daily_row(i: int, df: pd.DataFrame, C: dict, strategy: str) -
     ema_f = ema(close, ema_fast_n); ema_s = ema(close, ema_slow_n); a = atr(high, low, close, 14)
     sma200 = sma(close, 200)
     last_close, last_high = float(close.iloc[-1]), float(high.iloc[-1])
-    last_ema_f, last_ema_s, last_atr = float(ema_f.iloc[-1]), float(ema_s.iloc[-1]), float(a.iloc[-1])
+    last_atr = float(a.iloc[-1])
     st = strategy.lower()
-    if st == "auto" or st == "hybrid":
-        # mini-auto for daily
-        if last_ema_f > last_ema_s and last_close <= last_ema_f and (not np.isnan(sma200.iloc[-1]) and last_close >= float(sma200.iloc[-1])):
+    if st in ("auto","hybrid"):
+        if (ema_f.iloc[-1] > ema_s.iloc[-1]) and (not np.isnan(sma200.iloc[-1]) and last_close >= float(sma200.iloc[-1])) and last_close <= float(ema_f.iloc[-1]):
             st = "ema"
         elif float(rsi2(close).iloc[-1]) <= rsi2_th and (not np.isnan(sma200.iloc[-1]) and last_close > float(sma200.iloc[-1])):
             st = "rsi2"
@@ -808,7 +893,7 @@ def compute_levels_daily_row(i: int, df: pd.DataFrame, C: dict, strategy: str) -
     if not (sl < entry < tp): return None
     return (entry, sl, tp, st)
 
-def backtest_daily(symbol: str, start: str, end: str, C: dict, strategy: str="auto", capital_start: float=100000.0) -> BTResult:
+def backtest_daily(symbol: str, start: str, end: str, C: dict, strategy: str="auto", capital_start: float=100000.0) -> "BTResult":
     df = fetch_daily(symbol, start, end).dropna().copy()
     if len(df) < 260: raise RuntimeError("Need ≥ ~1y daily data.")
     tick = C.get("tick_size",0.05)
@@ -826,7 +911,7 @@ def backtest_daily(symbol: str, start: str, end: str, C: dict, strategy: str="au
                 qty = int(cash // entry_fill)
                 if qty > 0:
                     pos_qty = qty; pos_entry = entry_fill; pos_sl = sl_px; pos_tp = tp_px
-                    cash -= qty * entry_fill + per_share_cost * qty / 2.0  # approx half on entry
+                    cash -= qty * entry_fill + per_share_cost * qty / 2.0
                     trades.append({"date": str(n_dt), "action":"BUY", "price": entry_fill, "qty": qty, "cash": cash, "strategy": st})
         else:
             day_high = float(nxt["High"]); day_low = float(nxt["Low"])
@@ -930,7 +1015,6 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Reset to factory defaults.")
 
 async def non_command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Enforce “commands only”
     await update.message.reply_text("Use commands only. See /help.")
 
 # ================================ APP / JOBS ================================
@@ -949,6 +1033,8 @@ def build_app():
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("configure", cmd_configure))
     app.add_handler(CommandHandler("universe", cmd_universe))
+    app.add_handler(CommandHandler("universe_nse", cmd_universe_nse))   # NEW
+    app.add_handler(CommandHandler("indices", cmd_indices))             # NEW
     app.add_handler(CommandHandler("timeframe", cmd_timeframe))
     app.add_handler(CommandHandler("schedule", cmd_schedule))
     app.add_handler(CommandHandler("autoscan", cmd_autoscan))
