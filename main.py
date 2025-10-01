@@ -1,19 +1,18 @@
-# IndiQuant Apex AutoScan — Ultimate Edition (v4.2.0)
+# IndiQuant Apex AutoScan — Ultimate Edition (v4.2.1)
 # NSE/BSE • IST • Hands‑Free • Persistent • Portfolio Monitor • Multi‑TP & Trailing
 # -----------------------------------------------------------------------------
 # Educational only — not investment advice. Not SEBI-registered. Markets carry risk.
 # -----------------------------------------------------------------------------
 # Replit setup
-# 1) Add a .env file (or use Secrets) with TELEGRAM_BOT_TOKEN="<token>" and (optional) ADMIN_CHAT_ID
+# 1) Add a .env (or Replit Secrets) with TELEGRAM_BOT_TOKEN="<token>" and optional ADMIN_CHAT_ID
 # 2) requirements.txt (pin versions):
 #    python-telegram-bot==21.4
 #    yfinance==0.2.43
 #    pandas==2.2.2
 #    numpy==1.26.4
 #    requests==2.32.3
-#    python-dotenv==1.0.1
+#    python-dotenv==1.0.1   # optional (script runs without it)
 # 3) Click Run.
-# -----------------------------------------------------------------------------
 
 from __future__ import annotations
 import os, json, uuid, logging, math, asyncio, textwrap, time
@@ -25,7 +24,14 @@ import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
-from dotenv import load_dotenv
+
+# Optional: load .env if available (works without python-dotenv)
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except Exception:
+    # Replit secrets already populate os.environ; .env is optional
+    pass
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
@@ -35,7 +41,7 @@ from telegram.ext import (
 # ============================== CONSTANTS ==================================
 IST = ZoneInfo("Asia/Kolkata")
 BOT_NAME = "IndiQuant Apex Ultimate"
-VERSION = "v4.2.0"
+VERSION = "v4.2.1"
 COMPLIANCE = "Educational only — not investment advice. Not SEBI-registered. Markets carry risk."
 
 STATE_PATH = "/mnt/data/indiquant_state.json"
@@ -65,7 +71,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name
 log = logging.getLogger("indiquant.ultimate")
 
 # ============================== SECRETS ====================================
-load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "")  # optional default chat id
 
@@ -470,8 +475,8 @@ async def pick_setup(symbol: str, tf: str, cfg: Dict) -> Optional[Dict]:
     entry = round(raw_entry / tick) * tick
 
     # SL = max(ATR stop, structure stop)
-    swing_low = float(low.rolling(10).min().iloc[-2])
-    sl_atr = entry - cfg["sl"]["params"].get("atr_k", 2.5) * float(last["atr"]) 
+    swing_low = float(df["Low"].rolling(10).min().iloc[-2])
+    sl_atr = entry - cfg["sl"]["params"].get("atr_k", 2.5) * float(last["atr"])
     sl_struct = swing_low * 0.99
     sl_raw = min(sl_atr, sl_struct)
     sl = round(sl_raw / tick) * tick
@@ -583,6 +588,16 @@ def build_alert_html(payload: Dict, cfg: Dict) -> str:
 
 LAST_ALERT_VALID: Dict[str, str] = {}  # key = f"{sym}|{tf}" -> ISO time
 
+def bar_close_now(ts: datetime, tf: str, schedule: dict) -> bool:
+    m, s = ts.minute, ts.second
+    if s > 5: return False
+    if tf == "1m": return True
+    if tf == "5m": return m % 5 == 0
+    if tf == "15m": return m % 15 == 0
+    if tf == "1h": return m == 0
+    if tf.upper() == "D": return ts.strftime("%H:%M") == schedule["market_window"]["end"]
+    return False
+
 async def scan_once_for_tf(context: ContextTypes.DEFAULT_TYPE, tf: str):
     global SENT_THIS_MINUTE
     ts = now_ist()
@@ -619,16 +634,18 @@ async def scan_once_for_tf(context: ContextTypes.DEFAULT_TYPE, tf: str):
             if suppressed:
                 STATE["runtime"]["counters"]["suppressed"] += 1
             else:
-                chat_id = int(STATE["runtime"].get("chat_id") or ADMIN_CHAT_ID)
-                await send_html(context, chat_id, html)
-                STATE["runtime"]["counters"]["alerts_sent"] += 1
-                SENT_THIS_MINUTE += 1
-                SYMBOL_COUNT[symbol_session_key(sym, ts)] = SYMBOL_COUNT.get(symbol_session_key(sym, ts),0) + 1
-                # record dedupe horizon
-                LAST_ALERT_VALID[key] = ist_iso(ts + timedelta(minutes=STATE["config"].get("valid_minutes",180)))
-                # arm a pending trade to monitor entry trigger
-                arm_pending_trade_from_alert(payload)
-        except Exception:
+                chat_id = int(STATE["runtime"].get("chat_id") or (ADMIN_CHAT_ID or 0))
+                if chat_id:
+                    await send_html(context, chat_id, html)
+                    STATE["runtime"]["counters"]["alerts_sent"] += 1
+                    SENT_THIS_MINUTE += 1
+                    SYMBOL_COUNT[symbol_session_key(sym, ts)] = SYMBOL_COUNT.get(symbol_session_key(sym, ts),0) + 1
+                    # record dedupe horizon
+                    LAST_ALERT_VALID[key] = ist_iso(ts + timedelta(minutes=STATE["config"].get("valid_minutes",180)))
+                    # arm a pending trade to monitor entry trigger
+                    arm_pending_trade_from_alert(payload)
+        except Exception as e:
+            log.warning(f"scan error {sym}/{tf}: {e}")
             STATE["runtime"]["counters"]["skipped"] += 1
             continue
     save_state()
@@ -918,7 +935,7 @@ async def cmd_universe_nse(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_indices(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        ses = _nse_session(); r = ses.get(NSE_INDEX_LIST_URL, timeout=12); r.raise_for_status(); j = r.json();
+        ses = _nse_session(); r = ses.get(NSE_INDEX_LIST_URL, timeout=12); r.raise_for_status(); j = r.json()
         names = sorted({it.get("index") for it in j.get("data", []) if it.get("index")})
     except Exception:
         names = []
@@ -1036,8 +1053,9 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for t in closed_recent: lines.append(f"{t['symbol']} • {t['state']} • closed {t.get('closed_at','')} at events={len(t.get('log',[]))}")
     await update.message.reply_text("\n".join(lines) + f"\n\n<i>{COMPLIANCE}</i>", parse_mode="HTML")
 
+# -------- Improved /backtest (daily, next-open fills, SL priority if both hit) --------
+
 async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Simple daily closed-bar backtest with next-open entry and priority to SL if both hit
     if not context.args:
         await update.message.reply_text("Usage: /backtest SYMBOL start=YYYY-MM-DD end=YYYY-MM-DD [strategy=auto] [capital=100000]"); return
     sym = context.args[0].upper(); kv = parse_kv(context.args[1:])
@@ -1046,25 +1064,79 @@ async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         df = await fetch_ohlcv(sym, "D", start=start, end=end)
         if df is None or len(df) < 260: raise RuntimeError("Need ≥ ~1y daily data.")
+        # Precompute indicators once for whole period
+        close, high, low, vol = df["Close"], df["High"], df["Low"], df["Volume"]
         cfg = json.loads(json.dumps(STATE["config"]))
+        ema_fast_n = cfg["signal"]["params"].get("ema_fast", 20)
+        ema_slow_n = cfg["signal"]["params"].get("ema_slow", 50)
+        don_n = cfg["signal"]["params"].get("donchian_n", 20)
+        rsi2_th = cfg["signal"]["params"].get("rsi2_th", 10)
+        ema_f = ema(close, ema_fast_n); ema_s = ema(close, ema_slow_n)
+        sma200 = sma(close, 200)
+        a14 = atr(high, low, close, 14)
+        don_hi, _ = donchian(high, low, don_n)
+        vol_ma = vol.rolling(20).mean()
+        atr_pctile = a14.rolling(100).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1]*100, raw=False)
+        rsi2_now = rsi2(close)
+        # Benchmark RS (daily)
+        bench = await get_benchmark_df(cfg, "D")
+        rs_rate = rs_rating_from(df, bench)
+        indic = pd.DataFrame({
+            "Close": close, "High": high, "Low": low, "Volume": vol,
+            "ema_f": ema_f, "ema_s": ema_s, "sma200": sma200, "atr": a14,
+            "don_hi": don_hi.shift(1), "vol_ma": vol_ma, "rsi2": rsi2_now,
+            "atr_pctile": atr_pctile, "rs_rating": rs_rate
+        }).dropna()
         tick = cfg.get("tick_size", 0.05)
         cash = capital; pos = 0; entry_px = sl_px = tp_px = None
         trades = []
-        for i in range(70, len(df)-1):
-            today = df.iloc[:i+1].copy(); nxt = df.iloc[i+1]; n_date = str(df.index[i+1].date())
+        i_start = max(200, indic.index.get_indexer([indic.index[0]])[0])  # ensure enough history
+        for i in range(200, len(indic)-1):
+            today = indic.iloc[i]
+            nxt = df.iloc[i+1]
+            n_date = str(df.index[i+1].date())
+            # liquidity gate
+            dv = (df["Close"]*df["Volume"]).rolling(20).mean().iloc[i]
+            if dv < cfg["filters"]["min_adv_inr"]:
+                continue
             if pos == 0:
-                # compute setup on close of i
-                setup = await pick_setup(sym, "D", cfg)
-                if setup:
-                    e = setup["entry"]["price"]; s = setup["sl"]["price"]; t = setup["tp"]["price"]
-                    # next day open fill
-                    px_open = float(nxt["Open"])
-                    fill = max(e, px_open); fill = round(fill/tick)*tick
-                    cps = cost_per_share(fill, fill, cfg)
-                    qty = int(cash // (fill + cps))
-                    if qty>0:
-                        pos = qty; entry_px = fill; sl_px = s; tp_px = t; cash -= qty*fill + cps*qty/2
-                        trades.append({"date": n_date, "action":"BUY", "price": fill, "qty": qty, "cash": cash})
+                # gates: trend + RS
+                if not (today["Close"] >= today["sma200"] and today["ema_f"] >= today["ema_s"]): 
+                    continue
+                if today["rs_rating"] < cfg["signal"]["params"]["rs"].get("min_rating", 70):
+                    continue
+                vol_ok = cfg["signal"]["params"].get("vol_pctile_low", 40) <= today["atr_pctile"] <= cfg["signal"]["params"].get("vol_pctile_high", 70)
+                vol_conf = today["Volume"] > (today["vol_ma"] or 0)
+                signals = []
+                if today["Close"] <= today["ema_f"] and vol_conf:
+                    signals.append(("EMA Pullback", 65))
+                if today["rsi2"] <= rsi2_th and vol_ok and vol_conf:
+                    signals.append(("RSI2 Dip", 75))
+                if today["Close"] >= today["don_hi"] and vol_ok and vol_conf:
+                    signals.append(("Donchian Breakout", 70))
+                if not signals: 
+                    continue
+                best = max(signals, key=lambda x: x[1])[0]
+                bump = tick if tick >= 0.05 else 0.01
+                raw_entry = max(float(today["High"])+bump, float(today["don_hi"])+bump if not math.isnan(today["don_hi"]) else 0)
+                entry = round(raw_entry/tick)*tick
+                swing_low = float(df["Low"].rolling(10).min().iloc[i-1])
+                sl_atr = entry - cfg["sl"]["params"].get("atr_k", 2.5)*float(today["atr"])
+                sl_struct = swing_low*0.99
+                sl = round(min(sl_atr, sl_struct)/tick)*tick
+                # Multi-TP: final tp for RR
+                tp = entry + (cfg["tp"]["multi"]["tp2_r"] if cfg["tp"]["multi"]["enable"] else cfg["tp"]["params"]["r"]) * (entry - sl)
+                tp = round(tp/tick)*tick
+                if not (sl < entry < tp): 
+                    continue
+                # next day open entry (gap logic)
+                px_open = float(nxt["Open"])
+                fill = max(entry, px_open); fill = round(fill/tick)*tick
+                cps = cost_per_share(fill, fill, cfg)
+                qty = int(cash // (fill + cps))
+                if qty>0:
+                    pos = qty; entry_px = fill; sl_px = sl; tp_px = tp; cash -= qty*fill + cps*qty/2
+                    trades.append({"date": n_date, "action":"BUY", "price": fill, "qty": qty, "cash": cash})
             else:
                 day_high = float(nxt["High"]); day_low = float(nxt["Low"])
                 exit_px = None; reason = None
@@ -1081,15 +1153,20 @@ async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cash += pos*exit_px - cps*pos/2
             trades.append({"date": str(df.index[-1].date()), "action":"EOD", "price": exit_px, "qty": -pos, "cash": cash})
         # metrics
-        eq = pd.Series([t["cash"] for t in trades])
+        eq = pd.Series([capital] + [t["cash"] for t in trades])
         total_ret = (eq.iloc[-1] - capital) / capital
-        days = max(1, (df.index[-1].date() - df.index[70].date()).days)
+        days = max(1, (df.index[-1].date() - df.index[200].date()).days)
         cagr = (1+total_ret)**(365.25/days) - 1
-        pnls = pd.Series([0] + list(np.diff(eq))) / capital
-        vol = float(np.std(pnls, ddof=1))*math.sqrt(252)
-        sharpe = float(np.mean(pnls)/(np.std(pnls,ddof=1)+1e-9))*math.sqrt(252)
-        dd = (eq.values - np.maximum.accumulate(eq.values))/np.maximum.accumulate(eq.values)
-        maxdd = float(dd.min())
+        if len(eq) > 1:
+            pnls = pd.Series(np.diff(eq)) / capital
+            vol = float(np.std(pnls, ddof=1))*math.sqrt(252) if len(pnls)>1 else 0.0
+            sharpe = float(np.mean(pnls)/(np.std(pnls,ddof=1)+1e-9))*math.sqrt(252) if len(pnls)>1 else 0.0
+        else:
+            vol = sharpe = 0.0
+        vals = eq.values
+        peak = np.maximum.accumulate(vals)
+        dd = (vals - peak)/peak
+        maxdd = float(dd.min()) if len(dd)>0 else 0.0
         html = (
             f"<b>{ist_iso()}</b>\n<b>BACKTEST • {sym} • D</b>\n"
             f"Period: {start}..{end} • Start ₹{capital:.2f} → End ₹{float(eq.iloc[-1]):.2f}\n"
@@ -1122,7 +1199,7 @@ def setup_jobs(app: Application):
     # holiday refresh daily 06:00 IST
     jq.run_daily(lambda ctx: asyncio.create_task(fetch_nse_holidays()), time=dtime(hour=6, minute=0, tzinfo=IST), name="holiday_refresh")
 
-# ================================ BUILD/RUN ================================
+# ================================ BUILD/RUN ===============================
 
 def build_app() -> Application:
     if not TELEGRAM_BOT_TOKEN:
