@@ -1,6 +1,5 @@
-# requirements.txt
 python-telegram-bot==21.4
-yfinance==0.2.43
 pandas==2.2.2
 numpy==1.26.4
+jugaad-data==0.41
 requests==2.32.3
