@@ -1,34 +1,32 @@
-# IndiQuant Apex AutoScan — Long-Term Daily Scanner (v5.1.0, Replit-ready)
-# ============================================================================
-# Purpose: Bloomberg-style, no-nonsense DAILY swing alerts (NSE/BSE).
-#  - Universe: NIFTY 500 by default; /universe_all tries to expand broadly.
-#  - Strategy: Trend + Pullback/Breakout + RS + Volume confirm + MTF (weekly).
-#  - Outputs: Entry (stop), SL (ATR/structure), TP (multi-TP), Net R:R (India costs).
-#  - Backtest: Deterministic daily next-open model (SL priority), CSV & metrics.
-#  - Robust: Works on Replit (no asyncio loop errors), resilient NSE fetch with fallbacks.
+# IndiQuant Apex AutoScan — LT Daily Scanner (v5.2.0, Replit-ready, “No Excuses” build)
+# ======================================================================================
+# Bloomberg-style DAILY swing alerts & backtests for NSE/BSE cash equities/ETFs.
+#  • Universe: explicit list, NSE index (cached), or broad union (/universe_all).
+#  • Strategy: Trend + Pullback/Breakout + Relative-Strength + Volume confirm + Weekly MTF.
+#  • Alerts: Entry (stop), SL (ATR/structure), TP (multi-TP), Net R:R (India costs).
+#  • Backtest: Deterministic daily next-open model (SL priority), CSV + JSON metrics.
+#  • Robust: Works on Replit; resilient NSE fetch; hardened data layer; strong guards.
 #
 # Compliance: Educational only — not investment advice. Not SEBI-registered. Markets carry risk.
-# ============================================================================
+# ======================================================================================
 # Replit setup:
-#   1) Add a Secret: TELEGRAM_BOT_TOKEN = "123456:ABC..."
-#   2) Optionally:   ADMIN_CHAT_ID       = "123456789"
-#   3) requirements.txt:
-#        python-telegram-bot==21.4
-#        yfinance==0.2.43
-#        pandas==2.2.2
-#        numpy==1.26.4
-#        requests==2.32.3
+#   Secrets: TELEGRAM_BOT_TOKEN="123456:ABC..."  (and optionally ADMIN_CHAT_ID="123456789")
+#   requirements.txt:
+#     python-telegram-bot==21.4
+#     yfinance==0.2.43
+#     pandas==2.2.2
+#     numpy==1.26.4
+#     requests==2.32.3
 #
-# Quick start (send to your bot):
+# Quick start (send to your Telegram bot):
 #   /reset
 #   /universe_nse "NIFTY 500"
 #   /schedule tf=D
 #   /autoscan on
 #   /status
-#
 # Backtest example:
 #   /backtest RELIANCE start=2015-01-01 end=2025-09-30
-# ============================================================================
+# ======================================================================================
 
 from __future__ import annotations
 import os, json, uuid, logging, math, asyncio, time
@@ -50,7 +48,7 @@ from telegram.ext import (
 # ============================== CONSTANTS ==================================
 IST = ZoneInfo("Asia/Kolkata")
 BOT = "IndiQuant Apex LT"
-VER = "v5.1.0"
+VER = "v5.2.0"
 COMPLIANCE = "Educational only — not investment advice. Not SEBI-registered. Markets carry risk."
 
 STATE_PATH = "/mnt/data/indiquant_state_v5.json"
@@ -58,14 +56,14 @@ NSE_CACHE_PATH = "/mnt/data/nse_index_cache_v5.json"
 HOLIDAY_CACHE_PATH = "/mnt/data/nse_holidays_v5.json"
 BACKTEST_DIR = "/mnt/data/backtests"
 
-DATA_CACHE_TTL = 90  # seconds
+DATA_CACHE_TTL = 120   # seconds
 NSE_INDEX_TTL = 12 * 3600
 MAX_CONCURRENCY = 16
 
 HTTP_HEADERS_BASE = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/124.0.0.0 Safari/537.36",
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124.0.0.0 Safari/537.36"),
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-IN,en;q=0.9",
     "Referer": "https://www.nseindia.com/market-data/live-equity-market",
@@ -74,7 +72,6 @@ HTTP_HEADERS_BASE = {
 
 NSE_BASE = "https://www.nseindia.com"
 NSE_EQ_INDEX_URL = f"{NSE_BASE}/api/equity-stockIndices"
-NSE_INDICES_LIST_URL = f"{NSE_BASE}/api/allIndices"
 NSE_HOLIDAY_URL = f"{NSE_BASE}/api/holiday-master?type=trading"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
@@ -88,9 +85,9 @@ DEFAULT_STATE: Dict = {
     "config": {
         "timezone": "Asia/Kolkata",
         "universe": ["RELIANCE", "TCS", "HDFCBANK", "NIFTYBEES"],
-        "exchange": "NSE",                  # NSE | BSE | MIX
-        "timeframe": "D",                   # manual /alert default
-        "session": "swing",                 # long-term only
+        "exchange": "NSE",                  # NSE | BSE
+        "timeframe": "D",
+        "session": "swing",
         "square_off_time": "15:20",
         "data": {"source": "yfinance", "adjusted": True},
         "signal": {"name": "apex_long", "params": {
@@ -224,7 +221,7 @@ def save_state() -> None:
 def _nse_session() -> requests.Session:
     s = requests.Session()
     s.headers.update(HTTP_HEADERS_BASE)
-    # warm-up: homepage to set cookies
+    # warm-up to set cookies (helps reduce 401/403)
     try:
         s.get(NSE_BASE, timeout=8)
         s.get(NSE_BASE + "/market-data", timeout=8)
@@ -233,7 +230,6 @@ def _nse_session() -> requests.Session:
     return s
 
 def _nse_get_index_members(index_name: str, tries: int = 4) -> List[str]:
-    """Attempts to fetch index members; returns [] on failure."""
     ses = _nse_session()
     params = {"index": index_name}
     for i in range(tries):
@@ -253,7 +249,6 @@ def _nse_get_index_members(index_name: str, tries: int = 4) -> List[str]:
     return []
 
 def fetch_nse_index_symbols(index_name: str, ttl_sec: int = NSE_INDEX_TTL) -> List[str]:
-    """Cached index fetch with disk fallback to avoid 401 flakiness."""
     now = time.time()
     key = index_name.strip().upper()
     # mem cache
@@ -269,7 +264,7 @@ def fetch_nse_index_symbols(index_name: str, ttl_sec: int = NSE_INDEX_TTL) -> Li
                 return disk[key]["symbols"]
     except Exception:
         pass
-    # live fetch
+    # live
     symbols = _nse_get_index_members(index_name)
     exp = now + ttl_sec
     if symbols:
@@ -280,26 +275,16 @@ def fetch_nse_index_symbols(index_name: str, ttl_sec: int = NSE_INDEX_TTL) -> Li
         except Exception:
             pass
         return symbols
-    # fallback: try known broad indices in order
-    fallbacks = {
-        "NIFTY 500": ["NIFTY 500"],
-        "NIFTY 200": ["NIFTY 200", "NIFTY 500"],
-        "NIFTY 100": ["NIFTY 100", "NIFTY 200", "NIFTY 500"],
-        "NIFTY 50":  ["NIFTY 50", "NIFTY 100", "NIFTY 200", "NIFTY 500"],
-    }
-    for alt in fallbacks.get(key, []):
-        alt_syms = _nse_get_index_members(alt)
-        if alt_syms:
-            log.warning(f"Using fallback index '{alt}' for '{index_name}'.")
-            NSE_CACHE_MEM[key] = (alt_syms, now + ttl_sec)
-            return alt_syms
+    # simple fallback
+    fallback = _nse_get_index_members("NIFTY 500")
+    if fallback:
+        log.warning(f"Using fallback NIFTY 500 for '{index_name}'.")
+        NSE_CACHE_MEM[key] = (fallback, now + ttl_sec)
+        return fallback
     return []
 
 def build_all_symbols_nse() -> List[str]:
-    """
-    Broad but safe “ALL” builder: union of major broad indices only (to avoid many 401s).
-    This yields ~900–1200 unique names typically, not literally 3000.
-    """
+    """Broad, safe union of major indices (avoids niche endpoints → 401)."""
     candidates = [
         "NIFTY 50", "NIFTY NEXT 50", "NIFTY 100", "NIFTY 200", "NIFTY 500",
         "NIFTY MIDCAP 50", "NIFTY MIDCAP 100", "NIFTY MIDCAP 150",
@@ -314,8 +299,8 @@ def build_all_symbols_nse() -> List[str]:
         else:
             log.warning(f"Skipped '{idx}' (no data).")
     uni = sorted({s for s in universe if s})
-    if len(uni) < 100:  # safety fallback
-        log.warning("Universe fallback to 'NIFTY 500' (broad) due to fetch limits.")
+    if len(uni) < 100:
+        log.warning("Universe fallback to 'NIFTY 500' due to fetch limits.")
         uni = fetch_nse_index_symbols("NIFTY 500") or DEFAULT_STATE["config"]["universe"]
     return uni
 
@@ -327,6 +312,31 @@ def yahoo_symbol(sym: str, exchange: str = "NSE") -> str:
     if exchange.upper() == "BSE": return s + ".BO"
     return s + ".NS"
 
+def _standardize_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure single-level columns: Open/High/Low/Close/Volume; sorted index; no NaNs."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    # yfinance sometimes returns multi-index columns for multiple tickers
+    if isinstance(df.columns, pd.MultiIndex):
+        # assume single ticker: pick the first level
+        try:
+            first = df.columns.get_level_values(0).unique().tolist()[0]
+            df = df.xs(first, axis=1, level=0)
+        except Exception:
+            # flatten anyway
+            df.columns = ["_".join([str(x) for x in c]).strip() for c in df.columns.values]
+    # Normalize common names
+    rename_map = {c: c.title() for c in df.columns}
+    df = df.rename(columns=rename_map)
+    # Select required columns if available
+    cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+    df = df[cols].copy()
+    # Drop rows with any NaNs and ensure index sorted
+    df = df.dropna()
+    df = df[~df.index.duplicated(keep="last")]
+    df = df.sort_index()
+    return df
+
 def _yf_download(tickers: str, interval: Optional[str] = None, period: Optional[str] = None,
                  start: Optional[str] = None, end: Optional[str] = None) -> pd.DataFrame:
     last_exc: Optional[Exception] = None
@@ -334,32 +344,40 @@ def _yf_download(tickers: str, interval: Optional[str] = None, period: Optional[
         try:
             df = yf.download(tickers=tickers, interval=interval, period=period,
                              start=start, end=end, auto_adjust=True, progress=False)
-            if df is not None and not df.empty:
-                return df.rename(columns=str.title).dropna()
+            sdf = _standardize_df(df)
+            if not sdf.empty:
+                return sdf
         except Exception as e:
             last_exc = e
         time.sleep(0.8)
     if last_exc:
         raise last_exc
-    raise RuntimeError("No data from yfinance")
+    return pd.DataFrame()
 
 async def fetch_ohlcv(symbol: str, tf: str, period: Optional[str] = None,
                       start: Optional[str] = None, end: Optional[str] = None) -> pd.DataFrame:
+    """Return standardized OHLCV or empty DataFrame. NEVER returns None."""
     cache_key = (symbol, tf, period or start or "", end or "")
     now_ts = time.time()
     if cache_key in DATA_CACHE and now_ts - DATA_CACHE[cache_key][1] < DATA_CACHE_TTL:
-        return DATA_CACHE[cache_key][0]
+        return DATA_CACHE[cache_key][0].copy()
     loop = asyncio.get_event_loop()
-    if tf.lower() in ("d", "1d", "day"):
-        df = await loop.run_in_executor(None, lambda: _yf_download(yahoo_symbol(symbol, STATE["config"]["exchange"]),
-                                                                   start=start, end=end, period=period or "10y"))
-    elif tf.lower() in ("1wk", "w", "week"):
-        df = await loop.run_in_executor(None, lambda: _yf_download(yahoo_symbol(symbol, STATE["config"]["exchange"]),
-                                                                   interval="1wk", period=period or "20y"))
-    else:
-        raise ValueError("This LT bot supports only D and 1wk.")
+    ysym = yahoo_symbol(symbol, STATE["config"]["exchange"])
+    try:
+        if tf.lower() in ("d", "1d", "day"):
+            df = await loop.run_in_executor(None, lambda: _yf_download(ysym, start=start, end=end, period=period or "10y"))
+            # if explicit start/end returned empty (e.g., too short), try a longer generic period
+            if df.empty and (start or end):
+                df = await loop.run_in_executor(None, lambda: _yf_download(ysym, period="max"))
+        elif tf.lower() in ("1wk", "w", "week"):
+            df = await loop.run_in_executor(None, lambda: _yf_download(ysym, interval="1wk", period=period or "20y"))
+        else:
+            raise ValueError("This LT bot supports only D and 1wk.")
+    except Exception as e:
+        log.warning(f"yfinance failed for {symbol}/{tf}: {e}")
+        df = pd.DataFrame()
     DATA_CACHE[cache_key] = (df, now_ts)
-    return df
+    return df.copy()
 
 # =============================== INDICATORS ================================
 
@@ -376,7 +394,8 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     gain = up.rolling(period).mean()
     loss = down.rolling(period).mean()
     rs = gain / (loss.replace(0, np.nan))
-    return 100 - (100 / (1 + rs))
+    out = 100 - (100 / (1 + rs))
+    return out.fillna(method="bfill").fillna(50.0)
 
 def rsi2(series: pd.Series) -> pd.Series:
     return rsi(series, 2)
@@ -384,7 +403,7 @@ def rsi2(series: pd.Series) -> pd.Series:
 def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
     prev_close = close.shift(1)
     tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
+    return tr.rolling(period).mean().fillna(method="bfill")
 
 def donchian_high(high: pd.Series, n: int = 20) -> pd.Series:
     return high.rolling(n).max()
@@ -392,7 +411,7 @@ def donchian_high(high: pd.Series, n: int = 20) -> pd.Series:
 # ============================ STRATEGY ENGINE ==============================
 
 def adv_inr(df: pd.DataFrame, window: int = 20) -> Optional[float]:
-    if "Close" not in df or "Volume" not in df: return None
+    if df.empty or "Close" not in df or "Volume" not in df: return None
     dv = (df["Close"] * df["Volume"]).rolling(window).mean().dropna()
     return float(dv.iloc[-1]) if not dv.empty else None
 
@@ -404,9 +423,11 @@ async def get_benchmark_df(cfg: Dict, tf: str) -> Optional[pd.DataFrame]:
         return None
 
 def rs_rating_from(df: pd.DataFrame, bench: Optional[pd.DataFrame], lookback: int = 55) -> pd.Series:
-    if bench is None or bench.empty: return pd.Series(50.0, index=df.index)
+    if df.empty or bench is None or bench.empty:
+        return pd.Series(50.0, index=df.index)
     j = df[["Close"]].join(bench[["Close"]].rename(columns={"Close": "Bench"}), how="inner").dropna()
-    if j.empty: return pd.Series(50.0, index=df.index)
+    if j.empty:
+        return pd.Series(50.0, index=df.index)
     stock_norm = j["Close"] / j["Close"].iloc[0]
     bench_norm = j["Bench"] / j["Bench"].iloc[0]
     rs = stock_norm / bench_norm
@@ -419,7 +440,7 @@ def round_tick(p: float, tick: float) -> float:
 
 async def pick_setup(symbol: str, tf: str, cfg: Dict) -> Optional[Dict]:
     df = await fetch_ohlcv(symbol, tf)
-    if df is None or len(df) < 220: return None
+    if df.empty or len(df) < 220: return None
     close, high, low, vol = df["Close"], df["High"], df["Low"], df["Volume"]
     ema_fast_n = cfg["signal"]["params"].get("ema_fast", 20)
     ema_slow_n = cfg["signal"]["params"].get("ema_slow", 50)
@@ -436,27 +457,26 @@ async def pick_setup(symbol: str, tf: str, cfg: Dict) -> Optional[Dict]:
     bench = await get_benchmark_df(cfg, tf)
     rs_rate = rs_rating_from(df, bench)
 
-    last = pd.DataFrame({
+    feats = pd.DataFrame({
         "close": close, "high": high, "low": low,
         "ema_f": ema_f, "ema_s": ema_s, "sma200": sma200, "atr": a14,
         "don_hi": don_hi.shift(1), "vol": vol, "vol_ma": vol_ma,
         "rsi2": r2, "atr_pctile": atr_pctile, "rs_rating": rs_rate
-    }).dropna().iloc[-1]
+    }).dropna()
+    if feats.empty: return None
+    last = feats.iloc[-1]
 
     # Liquidity gate
     adv = adv_inr(df)
     if adv is None or adv < cfg["filters"]["min_adv_inr"]: return None
 
-    # MTF weekly filter
+    # MTF (weekly) filter
     if cfg["signal"]["params"].get("mtf", {}).get("enable", True):
-        try:
-            df_w = await fetch_ohlcv(symbol, cfg["signal"]["params"]["mtf"].get("htf", "1wk"))
-            if df_w is not None and len(df_w) > ema_slow_n + 5:
-                e_f = ema(df_w["Close"], ema_fast_n).iloc[-1]
-                e_s = ema(df_w["Close"], ema_slow_n).iloc[-1]
-                if not (e_f > e_s): return None
-        except Exception:
-            pass
+        df_w = await fetch_ohlcv(symbol, cfg["signal"]["params"]["mtf"].get("htf", "1wk"))
+        if df_w is not None and not df_w.empty and len(df_w) > ema_slow_n + 5:
+            e_f = ema(df_w["Close"], ema_fast_n).iloc[-1]
+            e_s = ema(df_w["Close"], ema_slow_n).iloc[-1]
+            if not (e_f > e_s): return None
 
     # Trend & RS gates
     if not (last["close"] >= last["sma200"] and last["ema_f"] >= last["ema_s"]): return None
@@ -469,12 +489,9 @@ async def pick_setup(symbol: str, tf: str, cfg: Dict) -> Optional[Dict]:
 
     # Candidate signals (long-only)
     signals = []
-    if (last["close"] <= last["ema_f"]) and vol_conf:
-        signals.append(("EMA Pullback", 65))
-    if (last["rsi2"] <= cfg["signal"]["params"].get("rsi2_th", 10)) and vol_ok and vol_conf:
-        signals.append(("RSI2 Dip", 75))
-    if (last["close"] >= last["don_hi"]) and vol_ok and vol_conf:
-        signals.append(("Donchian Breakout", 70))
+    if (last["close"] <= last["ema_f"]) and vol_conf: signals.append(("EMA Pullback", 65))
+    if (last["rsi2"] <= cfg["signal"]["params"].get("rsi2_th", 10)) and vol_ok and vol_conf: signals.append(("RSI2 Dip", 75))
+    if (last["close"] >= last["don_hi"]) and vol_ok and vol_conf: signals.append(("Donchian Breakout", 70))
     if not signals: return None
 
     best = max(signals, key=lambda x: x[1])
@@ -486,7 +503,7 @@ async def pick_setup(symbol: str, tf: str, cfg: Dict) -> Optional[Dict]:
     entry = round_tick(raw_entry, tick)
 
     # SL: ATR or structure (whichever is farther) then tick-round
-    swing_low = float(df["Low"].rolling(10).min().iloc[-2])
+    swing_low = float(df["Low"].rolling(10).min().iloc[-2]) if len(df) >= 12 else float(last["low"])
     sl_atr = entry - atr_k_sl * float(last["atr"])
     sl_struct = swing_low * 0.99
     sl = round_tick(min(sl_atr, sl_struct), tick)
@@ -720,127 +737,173 @@ async def refresh_holidays_job(context: ContextTypes.DEFAULT_TYPE):
 # ================================ BACKTEST =================================
 
 def backtest_daily_next_open(df: pd.DataFrame, cfg: Dict) -> Tuple[pd.DataFrame, Dict]:
-    """Deterministic daily backtest. See v5.0 notes; SL priority."""
-    if df is None or len(df) < 260:
-        return pd.DataFrame(), {}
-    close, high, low, vol = df["Close"], df["High"], df["Low"], df["Volume"]
-    ema_f = ema(close, cfg["signal"]["params"].get("ema_fast", 20))
-    ema_s = ema(close, cfg["signal"]["params"].get("ema_slow", 50))
-    sma200 = sma(close, 200)
-    a14 = atr(high, low, close, 14)
-    don_hi = donchian_high(high, cfg["signal"]["params"].get("donchian_n", 20))
-    vol_ma = vol.rolling(20).mean()
-    atr_pctile = a14.rolling(150).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1] * 100, raw=False)
-    r2 = rsi2(close)
+    """
+    Deterministic daily backtest. Returns (trades_df, metrics_dict).
+    Never raises. If insufficient data → (empty, {}).
+    """
+    try:
+        if df is None or df.empty or not set(["Open","High","Low","Close","Volume"]).issubset(df.columns):
+            return pd.DataFrame(), {}
+        if len(df) < 260:
+            return pd.DataFrame(), {}
 
-    tick = cfg.get("tick_size", 0.05)
-    rows = []
-    in_pos = False
-    entry = sl = tp = tp1 = None
-    trail_be = cfg["tp"]["multi"].get("trail_be", True)
-    trail_atr = cfg["tp"]["multi"].get("trail_atr", True)
-    trail_k = cfg["tp"]["multi"].get("trail_atr_k", 3.0)
+        close, high, low, vol = df["Close"], df["High"], df["Low"], df["Volume"]
+        ema_f = ema(close, cfg["signal"]["params"].get("ema_fast", 20))
+        ema_s = ema(close, cfg["signal"]["params"].get("ema_slow", 50))
+        sma200 = sma(close, 200)
+        a14 = atr(high, low, close, 14)
+        don_hi = donchian_high(high, cfg["signal"]["params"].get("donchian_n", 20))
+        vol_ma = vol.rolling(20).mean()
+        atr_pctile = a14.rolling(150).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1] * 100, raw=False)
+        r2 = rsi2(close)
 
-    for i in range(210, len(df) - 1):
-        today = df.index[i]
-        tom = df.index[i + 1]
-        last = pd.Series({
-            "close": close.iloc[i], "high": high.iloc[i], "low": low.iloc[i],
-            "ema_f": ema_f.iloc[i], "ema_s": ema_s.iloc[i], "sma200": sma200.iloc[i],
-            "atr": a14.iloc[i], "don_hi": don_hi.shift(1).iloc[i],
-            "vol": vol.iloc[i], "vol_ma": vol_ma.iloc[i], "rsi2": r2.iloc[i], "atr_pctile": atr_pctile.iloc[i]
-        })
-        adv = float((close * vol).rolling(20).mean().iloc[i] or 0)
+        tick = cfg.get("tick_size", 0.05)
+        rows = []
+        in_pos = False
+        entry = sl = tp = tp1 = None
+        trail_be = cfg["tp"]["multi"].get("trail_be", True)
+        trail_atr = cfg["tp"]["multi"].get("trail_atr", True)
+        trail_k = cfg["tp"]["multi"].get("trail_atr_k", 3.0)
+        atr_k_sl = cfg["signal"]["params"].get("atr_k_sl", 2.5)
 
-        if in_pos:
-            o, h, l, c = df.loc[tom, ["Open", "High", "Low", "Close"]]
-            exit_px = None; exit_reason = None
-            if trail_be and tp1 and h >= tp1 and sl < entry:
-                sl = entry
-            if trail_atr and h >= (tp1 or 1e18):  # trail only post-TP1
-                new_sl = c - (trail_k * a14.iloc[i + 1])
-                sl = max(sl, round_tick(float(new_sl), tick))
+        # iterate, using i for "signal day", enter at next day's open or stop
+        for i in range(210, len(df) - 1):
+            today = df.index[i]
+            tom = df.index[i + 1]
 
-            if l <= sl and h >= tp:
-                exit_px = sl; exit_reason = "SL"
-            elif l <= sl:
-                exit_px = sl; exit_reason = "SL"
-            elif h >= tp:
-                exit_px = tp; exit_reason = "TP"
-            elif o <= sl:
-                exit_px = o; exit_reason = "SL_gap"
-            elif o >= tp:
-                exit_px = o; exit_reason = "TP_gap"
-
-            if exit_px is not None:
-                cps = cost_per_share(entry, exit_px, cfg)
-                pnl_net = (exit_px - entry) - cps
-                rows.append({"date": tom.strftime("%Y-%m-%d"), "action": exit_reason, "price": float(exit_px), "pnl_net": float(pnl_net)})
-                in_pos = False; entry = sl = tp = tp1 = None
+            # Safeguard row existence
+            try:
+                last = {
+                    "close": float(close.iloc[i]),
+                    "high": float(high.iloc[i]),
+                    "low": float(low.iloc[i]),
+                    "ema_f": float(ema_f.iloc[i]),
+                    "ema_s": float(ema_s.iloc[i]),
+                    "sma200": float(sma200.iloc[i]),
+                    "atr": float(a14.iloc[i]),
+                    "don_hi": float(don_hi.shift(1).iloc[i]) if not pd.isna(don_hi.shift(1).iloc[i]) else np.nan,
+                    "vol": float(vol.iloc[i]),
+                    "vol_ma": float(vol_ma.iloc[i]) if not pd.isna(vol_ma.iloc[i]) else 0.0,
+                    "rsi2": float(r2.iloc[i]),
+                    "atr_pctile": float(atr_pctile.iloc[i]) if not pd.isna(atr_pctile.iloc[i]) else 50.0
+                }
+            except Exception:
                 continue
 
-        if not in_pos:
-            if not (last["close"] >= last["sma200"] and last["ema_f"] >= last["ema_s"]): continue
-            if adv < cfg["filters"]["min_adv_inr"]: continue
-            vol_ok = cfg["signal"]["params"].get("vol_pctile_low", 30) <= last["atr_pctile"] <= cfg["signal"]["params"].get("vol_pctile_high", 85)
-            vol_conf = last["vol"] > (last["vol_ma"] or 0)
+            adv_val = float((close * vol).rolling(20).mean().fillna(0.0).iloc[i])
+            if in_pos:
+                # next-day bar
+                try:
+                    o, h, l, c = [float(df.loc[tom, k]) for k in ["Open","High","Low","Close"]]
+                except Exception:
+                    continue
+                exit_px = None; exit_reason = None
 
-            signals = []
-            if (last["close"] <= last["ema_f"]) and vol_conf: signals.append(("EMA Pullback", 65))
-            if (last["rsi2"] <= cfg["signal"]["params"].get("rsi2_th", 10)) and vol_ok and vol_conf: signals.append(("RSI2 Dip", 75))
-            if (last["close"] >= last["don_hi"]) and vol_ok and vol_conf: signals.append(("Donchian Breakout", 70))
-            if not signals: continue
-            sig = max(signals, key=lambda x: x[1])
+                if trail_be and tp1 and h >= tp1 and sl < entry:
+                    sl = entry
+                if trail_atr and (tp1 is None or h >= tp1):
+                    new_sl = c - (trail_k * float(a14.iloc[i + 1]))
+                    sl = max(sl, round_tick(float(new_sl), tick))
 
-            raw_entry = max(float(last["high"]) + tick,
-                            float(last["don_hi"]) + tick if not math.isnan(last["don_hi"]) else 0)
-            entry = round_tick(raw_entry, tick)
-            sl_atr = entry - cfg["signal"]["params"].get("atr_k_sl", 2.5) * float(last["atr"])
-            sl_struct = float(df["Low"].rolling(10).min().iloc[i - 1]) * 0.99
-            sl = round_tick(min(sl_atr, sl_struct), tick)
-            tp1 = round_tick(entry + cfg["tp"]["multi"].get("tp1_r", 1.5) * (entry - sl), tick)
-            tp = round_tick(entry + cfg["tp"]["multi"].get("tp2_r", 3.0) * (entry - sl), tick)
+                # SL priority within bar
+                if l <= sl and h >= tp:
+                    exit_px = sl; exit_reason = "SL"
+                elif l <= sl:
+                    exit_px = sl; exit_reason = "SL"
+                elif h >= tp:
+                    exit_px = tp; exit_reason = "TP"
+                elif o <= sl:
+                    exit_px = o; exit_reason = "SL_gap"
+                elif o >= tp:
+                    exit_px = o; exit_reason = "TP_gap"
 
-            o_next = float(df.loc[tom, "Open"])
-            if o_next >= entry:
-                rows.append({"date": tom.strftime("%Y-%m-%d"), "action": "ENTRY", "price": float(o_next), "pnl_net": 0.0})
-                entry = o_next
-                in_pos = True
-            else:
-                h_next = float(df.loc[tom, "High"])
-                if h_next >= entry:
-                    rows.append({"date": tom.strftime("%Y-%m-%d"), "action": "ENTRY", "price": float(entry), "pnl_net": 0.0})
+                if exit_px is not None:
+                    cps = cost_per_share(entry, exit_px, cfg)
+                    pnl_net = (exit_px - entry) - cps
+                    rows.append({"date": tom.strftime("%Y-%m-%d"), "action": exit_reason, "price": float(exit_px), "pnl_net": float(pnl_net)})
+                    in_pos = False; entry = sl = tp = tp1 = None
+                    continue
+
+            if not in_pos:
+                # Gates
+                if not (last["close"] >= last["sma200"] and last["ema_f"] >= last["ema_s"]): 
+                    continue
+                if adv_val < cfg["filters"]["min_adv_inr"]: 
+                    continue
+                vol_ok = cfg["signal"]["params"].get("vol_pctile_low", 30) <= last["atr_pctile"] <= cfg["signal"]["params"].get("vol_pctile_high", 85)
+                vol_conf = last["vol"] > (last["vol_ma"] or 0)
+
+                # Signals
+                sigs = []
+                if (last["close"] <= last["ema_f"]) and vol_conf: sigs.append(("EMA Pullback", 65))
+                if (last["rsi2"] <= cfg["signal"]["params"].get("rsi2_th", 10)) and vol_ok and vol_conf: sigs.append(("RSI2 Dip", 75))
+                if (not np.isnan(last["don_hi"]) and last["close"] >= last["don_hi"]) and vol_ok and vol_conf: sigs.append(("Donchian Breakout", 70))
+                if not sigs: 
+                    continue
+                sig = max(sigs, key=lambda x: x[1])
+
+                # Levels
+                raw_entry = max(float(last["high"]) + tick,
+                                float(last["don_hi"]) + tick if not np.isnan(last["don_hi"]) else 0)
+                e = round_tick(raw_entry, tick)
+                s_atr = e - atr_k_sl * float(last["atr"])
+                s_struct = float(low.rolling(10).min().iloc[i - 1]) * 0.99 if i >= 11 else float(last["low"]) * 0.99
+                s = round_tick(min(s_atr, s_struct), tick)
+                t1 = round_tick(e + cfg["tp"]["multi"].get("tp1_r", 1.5) * (e - s), tick)
+                t2 = round_tick(e + cfg["tp"]["multi"].get("tp2_r", 3.0) * (e - s), tick)
+                if not (s < e < t2):
+                    continue
+
+                # Enter at next open or stop intrabar
+                try:
+                    o_next = float(df.loc[tom, "Open"]); h_next = float(df.loc[tom, "High"])
+                except Exception:
+                    continue
+                if o_next >= e:
+                    rows.append({"date": tom.strftime("%Y-%m-%d"), "action": "ENTRY", "price": float(o_next), "pnl_net": 0.0})
+                    entry, sl, tp, tp1 = o_next, s, t2, t1
+                    in_pos = True
+                elif h_next >= e:
+                    rows.append({"date": tom.strftime("%Y-%m-%d"), "action": "ENTRY", "price": float(e), "pnl_net": 0.0})
+                    entry, sl, tp, tp1 = e, s, t2, t1
                     in_pos = True
                 else:
                     entry = sl = tp = tp1 = None
+                    in_pos = False
                     continue
 
-    trades = pd.DataFrame(rows)
-    if trades.empty:
-        return trades, {}
-
-    pnl_series = trades["pnl_net"].astype(float)
-    equity = pnl_series.cumsum()
-    total_net = float(equity.iloc[-1]) if not equity.empty else 0.0
-    wins = int((trades["action"].str.contains("TP")).sum())
-    losses = int((trades["action"].str.startswith("SL")).sum())
-    trades_n = wins + losses
-    winrate = (wins / max(1, trades_n)) * 100
-    avg = float(pnl_series.mean())
-    pf = (pnl_series[pnl_series > 0].sum() / abs(pnl_series[pnl_series < 0].sum())) if (pnl_series[pnl_series < 0].sum() != 0) else float('inf')
-    cum = equity
-    peak = cum.cummax()
-    dd = (cum - peak)
-    maxdd = float(dd.min()) if not dd.empty else 0.0
-    metrics = {
-        "TotalNet(₹/share)": round(total_net, 2),
-        "Trades": trades_n,
-        "WinRate%": round(winrate, 2),
-        "AvgTrade(₹/share)": round(avg, 2),
-        "ProfitFactor": round(float(pf), 2) if np.isfinite(pf) else float('inf'),
-        "MaxDD(₹/share)": round(maxdd, 2)
-    }
-    return trades, metrics
+        trades = pd.DataFrame(rows)
+        if trades.empty:
+            return trades, {}
+        pnl_series = trades["pnl_net"].astype(float)
+        equity = pnl_series.cumsum()
+        total_net = float(equity.iloc[-1]) if not equity.empty else 0.0
+        wins = int((trades["action"].str.contains("TP")).sum())
+        losses = int((trades["action"].str.startswith("SL")).sum())
+        trades_n = int((trades["action"] == "ENTRY").sum())  # entries counted
+        # refine wins/losses count to terminations
+        term_n = wins + losses + int((trades["action"].str.contains("gap")).sum())
+        winrate = (wins / max(1, term_n)) * 100
+        avg = float(pnl_series.mean())
+        pf_denom = pnl_series[pnl_series < 0].sum()
+        pf = (pnl_series[pnl_series > 0].sum() / abs(pf_denom)) if pf_denom != 0 else float('inf')
+        cum = equity
+        peak = cum.cummax()
+        dd = (cum - peak)
+        maxdd = float(dd.min()) if not dd.empty else 0.0
+        metrics = {
+            "TotalNet(₹/share)": round(total_net, 2),
+            "Trades": trades_n,
+            "Terminations": term_n,
+            "WinRate%": round(winrate, 2),
+            "AvgTrade(₹/share)": round(avg, 2),
+            "ProfitFactor": round(float(pf), 2) if np.isfinite(pf) else float('inf'),
+            "MaxDD(₹/share)": round(maxdd, 2)
+        }
+        return trades, metrics
+    except Exception as e:
+        log.warning(f"Backtest internal error: {e}")
+        return pd.DataFrame(), {}
 
 # ================================ COMMANDS =================================
 
@@ -852,8 +915,8 @@ Core:
 /reset — factory defaults
 /universe RELIANCE,TCS,... — set explicit symbols
 /universe_nse "NIFTY 500" — set from NSE index (cached; resilient)
-/universe_all — broad union of major indices (safe subset; avoids 401 spam)
-/schedule tf=D — daily scans at market close; /autoscan on to run
+/universe_all — broad union of major indices (safe subset)
+/schedule tf=D — daily scans at market close; then /autoscan on
 /autoscan on|off — toggle autonomous scans
 /alert SYMBOL [D] — immediate proposal for one symbol
 /backtest SYMBOL start=YYYY-MM-DD end=YYYY-MM-DD — daily next-open backtest
@@ -891,6 +954,8 @@ async def cmd_universe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /universe RELIANCE,TCS,HDFCBANK,NIFTYBEES"); return
     syms = [s.strip().upper().replace(".NS", "").replace(".BO", "") for s in " ".join(context.args).split(",") if s.strip()]
+    if not syms:
+        await update.message.reply_text("No valid symbols."); return
     STATE["config"]["universe"] = sorted(list(set(syms))); save_state()
     await update.message.reply_text(f"Universe set: {len(STATE['config']['universe'])} symbols")
 
@@ -914,13 +979,17 @@ async def cmd_universe_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kv = parse_kv(context.args)
-    if "tf" in kv: STATE["schedule"]["timeframes"] = [t.strip() for t in kv["tf"].split(",") if t.strip()]
+    if "tf" in kv:
+        tfs = [t.strip().upper() for t in kv["tf"].split(",") if t.strip()]
+        if not tfs: tfs = ["D"]
+        # LT bot supports D scans; we store whatever, but scan job uses D
+        STATE["schedule"]["timeframes"] = tfs
     save_state()
     await update.message.reply_text(f"Schedule updated: {STATE['schedule']}")
 
 async def cmd_autoscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = context.args[0].lower() if context.args else "on"
-    on = mode == "on"
+    on = (mode == "on")
     STATE["schedule"]["autoscan"] = on
     STATE["runtime"]["autoscan"] = "on" if on else "off"
     save_state()
@@ -956,9 +1025,13 @@ async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Provide start=YYYY-MM-DD end=YYYY-MM-DD"); return
     try:
         df = await fetch_ohlcv(sym, "D", start=start, end=end)
+        if df.empty:
+            # try a broader period and then trim
+            df_all = await fetch_ohlcv(sym, "D", period="max")
+            df = df_all.loc[(df_all.index >= start) & (df_all.index <= end)].copy() if not df_all.empty else pd.DataFrame()
         trades, metrics = backtest_daily_next_open(df, STATE["config"])
-        if trades.empty:
-            await update.message.reply_text("No trades in backtest period."); return
+        if trades.empty or not metrics:
+            await update.message.reply_text("No trades (or insufficient data) in the backtest period."); return
         ensure_dirs()
         tpath = os.path.join(BACKTEST_DIR, f"{sym}_trades.csv")
         trades.to_csv(tpath, index=False)
@@ -1007,12 +1080,12 @@ def build_app() -> Application:
 
 if __name__ == "__main__":
     load_state()
-    # Create an event loop explicitly (fixes Replit “no current event loop”)
+    # Create a dedicated loop explicitly (fixes Replit “no current event loop” cases)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     app = build_app()
     log.info(f"Starting {BOT} {VER} …")
     try:
-        app.run_polling()  # blocking; uses the loop we set
+        app.run_polling()  # blocking; PTB manages asyncio internally
     except KeyboardInterrupt:
         log.info("Shutdown requested.")
